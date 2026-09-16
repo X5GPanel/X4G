@@ -1,472 +1,255 @@
-# xhttp_siz10.py
-# ══════════════════════════════════════════════════════════════════════════════
-# Siz10a · XHTTP Ultra Transport — دو مد: packet-up / stream-up
-#  (stream-one حذف شد. منطق relay_vless دست‌نخورده.
-#   stream-up بازنویسی شده با موتور تطبیقی: _AdaptiveFlow (AIMD روی high-water)
-#   + _QuotaGate تطبیقی (batch بر اساس نرخ واقعی هر سشن) + سوکت تیون‌شده)
-# ══════════════════════════════════════════════════════════════════════════════
-
-import asyncio
-import secrets
-import socket
-import time
-from datetime import datetime
-
-from fastapi import APIRouter, Request, HTTPException
-from fastapi.responses import StreamingResponse
-
-from main import (
-    LINKS,
-    LINKS_LOCK,
-    stats,
-    hourly_traffic,
-    connections,
-    error_logs,
-    logger,
-    is_link_allowed,
-    is_ip_allowed,
-    save_state,
-)
-from relay_vless import parse_vless_header, check_and_use
-from speed_limit import throttle
-
-router = APIRouter()
-
-XHTTP_BUF = 512 * 1024
-DOWNLINK_QUEUE_MAX = 512
-SESSION_IDLE_TIMEOUT = 30
-REAPER_INTERVAL = 10
-TCP_CONNECT_TIMEOUT = 10.0
-
-# ── تنظیمات موتور تطبیقی ──────────────────────────────────────────────────────
-SOCK_BUF_SIZE = 2 * 1024 * 1024     # SO_SNDBUF / SO_RCVBUF
-
-# _AdaptiveFlow: بازه‌ی مجاز برای high-water تطبیقی (AIMD)
-FLOW_MIN_HW = 256 * 1024
-FLOW_MAX_HW = 16 * 1024 * 1024
-FLOW_START_HW = 2 * 1024 * 1024
-FLOW_FAST_DRAIN_MS = 2.0    # زیر این یعنی downstream خیلی سریعه → بافر مجاز رو زیاد کن
-FLOW_SLOW_DRAIN_MS = 25.0   # بالای این یعنی backpressure واقعی → فوری نصفش کن
-
-# _QuotaGate: بازه‌ی مجاز برای batch تطبیقی چک کوتا
-QUOTA_MIN_BATCH = 32 * 1024
-QUOTA_MAX_BATCH = 1 * 1024 * 1024
-QUOTA_START_BATCH = 64 * 1024
-QUOTA_CHECK_INTERVAL = 0.2  # سقف زمانی؛ حتی اگر batch پر نشده، بعد این مدت چک کن
-
-PACKET_UP_HIGH_WATER = 2 * 1024 * 1024  # packet-up همون منطق ساده‌ی قبلی رو داره (تمرکز این راند فقط stream-up بود)
-
-xhttp_sessions: dict = {}
-XHTTP_LOCK = asyncio.Lock()
-
-FINGERPRINTS = {
-    "chrome": {
-        "content-type": "application/grpc",
-        "cache-control": "no-cache, no-store",
-        "x-accel-buffering": "no",
-        "server": "cloudflare",
-    },
-    "plain": {
-        "content-type": "application/octet-stream",
-        "cache-control": "no-store",
-        "x-accel-buffering": "no",
-    },
-}
-DEFAULT_FINGERPRINT = "chrome"
-
-
-def _resp_headers(fp: str) -> dict:
-    return dict(FINGERPRINTS.get(fp, FINGERPRINTS[DEFAULT_FINGERPRINT]))
-
-
-def _tune_socket(writer: asyncio.StreamWriter):
-    """TCP_NODELAY + بافرهای بزرگ‌تر سوکت برای کاهش سربار سیستم‌عامل روی ترافیک بالا."""
-    sock = writer.transport.get_extra_info("socket")
-    if not sock:
-        return
-    try:
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCK_BUF_SIZE)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCK_BUF_SIZE)
-    except OSError:
-        pass
-
-
-class _QuotaGate:
-    """
     نسخه‌ی تطبیقی: به‌جای await check_and_use() به‌ازای هر چانک، و به‌جای یک آستانه‌ی
     ثابت، نرخ واقعی ترافیک هر سشن رو با EWMA اندازه می‌گیره و اندازه‌ی batch رو زنده
-    عوض می‌کنه:
-      - سشن پرسرعت (دانلود حجیم) → batch بزرگ می‌شه → await های سنگین کمتر.
-      - سشن کم‌ترافیک/تعاملی → batch کوچیک می‌مونه → کوتا دقیق‌تر و قطع سریع‌تر
-        اگه کاربر تموم کرده باشه.
-    داده هیچ‌وقت نگه داشته نمی‌شه، فقط لحظه‌ی چک‌کردنِ کوتا adaptive هست.
+    تنظیم می‌کنه (بین QUOTA_MIN_BATCH و QUOTA_MAX_BATCH).
     """
-    __slots__ = ("uuid", "pending", "last_check", "ok", "batch_bytes", "rate_ewma")
 
-    def __init__(self, uuid: str):
-        self.uuid = uuid
+    def __init__(self, link_name: str, client_ip: str):
+        self.link_name = link_name
+        self.client_ip = client_ip
+        self.batch_size = QUOTA_START_BATCH
         self.pending = 0
         self.last_check = time.monotonic()
-        self.ok = True
-        self.batch_bytes = QUOTA_START_BATCH
-        self.rate_ewma = 0.0
+        self.bytes_since_last_check = 0
+        self.ewma_rate = 0.0
 
-    async def add(self, nbytes: int) -> bool:
-        if not self.ok:
-            return False
-        self.pending += nbytes
+    async def consume(self, length: int):
         now = time.monotonic()
-        elapsed = now - self.last_check
-        if self.pending >= self.batch_bytes or elapsed >= QUOTA_CHECK_INTERVAL:
-            flush, self.pending = self.pending, 0
-            if elapsed > 0:
-                inst_rate = flush / elapsed
-                self.rate_ewma = inst_rate if self.rate_ewma == 0 else (0.7 * self.rate_ewma + 0.3 * inst_rate)
-                target = int(self.rate_ewma * QUOTA_CHECK_INTERVAL)
-                self.batch_bytes = max(QUOTA_MIN_BATCH, min(QUOTA_MAX_BATCH, target or QUOTA_MIN_BATCH))
-            self.last_check = now
-            self.ok = await check_and_use(self.uuid, flush)
-            return self.ok
-        return True
+        dt = now - self.last_check
+        self.pending += length
+        self.bytes_since_last_check += length
 
-    async def flush(self) -> bool:
-        if self.pending:
-            flush, self.pending = self.pending, 0
-            self.ok = self.ok and await check_and_use(self.uuid, flush)
-        return self.ok
+        # اگر زمان چک رسیده یا مقدار پندینگ از اندازه بَچ بیشتر شده
+        if dt >= QUOTA_CHECK_INTERVAL or self.pending >= self.batch_size:
+            # ۱. کسر کوتا از سیستم اصلی
+            ok = await check_and_use(self.link_name, self.pending, self.client_ip)
+            if not ok:
+                raise HTTPException(status_code=403, detail="Quota exceeded or link disabled")
+
+            # ۲. به‌روزرسانی EWMA برای محاسبه نرخ ترافیک (بایت بر ثانیه)
+            if dt > 0.001:
+                inst_rate = self.bytes_since_last_check / dt
+                self.ewma_rate = 0.7 * self.ewma_rate + 0.3 * inst_rate if self.ewma_rate > 0 else inst_rate
+
+            # ۳. تنظیم تطبیقی اندازه بَچ بر اساس نرخ ترافیک (هدف: ~200ms بین چک‌ها)
+            target_batch = int(self.ewma_rate * QUOTA_CHECK_INTERVAL)
+            self.batch_size = max(QUOTA_MIN_BATCH, min(QUOTA_MAX_BATCH, target_batch))
+
+            # ریست شمارنده‌ها
+            self.pending = 0
+            self.bytes_since_last_check = 0
+            self.last_check = now
 
 
 class _AdaptiveFlow:
     """
-    high-water تطبیقی برای drain(), رفتار شبیه AIMD در TCP congestion control:
-      - هر بار drain() صدا زده می‌شه، مدت زمانش اندازه‌گیری می‌شه.
-      - اگه سریع تموم بشه (لینک پایین‌دستی داره جواب می‌ده) → سقف بافر مجاز رو
-        additive increase می‌کنیم؛ یعنی دفعه‌ی بعد دیرتر drain صدا زده می‌شه،
-        پس syscall/context-switch کمتر می‌شه و throughput واقعی بالا می‌ره.
-      - اگه drain کند بشه (backpressure واقعیه، صف داره جمع می‌شه) → سقف رو فوری
-        نصف می‌کنیم (multiplicative decrease) تا بافربلوت/لتنسی رشد نکنه.
-    هر سشن یک نمونه‌ی جدا از این داره، پس مسیرهای کند و سریع تداخلی با هم ندارن.
+    کنترل جریان تطبیقی (AIMD) روی بافر Downlink برای جلوگیری از ایجاد Backpressure
+    و بهینه‌سازی سرعت دانلود متناسب با توان پردازشی کلاینت.
     """
-    __slots__ = ("high_water", "last_drain_ms")
 
-    def __init__(self):
+    def __init__(self, queue: asyncio.Queue):
+        self.queue = queue
         self.high_water = FLOW_START_HW
-        self.last_drain_ms = 0.0
+        self.low_water = self.high_water // 2
 
-    def should_drain(self, buf_size: int) -> bool:
-        return buf_size > self.high_water
+    def adjust(self, drain_time_ms: float):
+        if drain_time_ms < FLOW_FAST_DRAIN_MS:
+            # رشد خطی high-water در صورت سرعت بالای کلاینت
+            self.high_water = min(FLOW_MAX_HW, int(self.high_water + 128 * 1024))
+        elif drain_time_ms > FLOW_SLOW_DRAIN_MS:
+            # کاهش ضربی (AIMD) در صورت کندی کلاینت یا ایجاد Backpressure
+            self.high_water = max(FLOW_MIN_HW, int(self.high_water * 0.7))
 
-    async def drain(self, writer: asyncio.StreamWriter):
-        t0 = time.monotonic()
-        await writer.drain()
-        elapsed_ms = (time.monotonic() - t0) * 1000
-        self.last_drain_ms = elapsed_ms
-        if elapsed_ms < FLOW_FAST_DRAIN_MS:
-            self.high_water = min(FLOW_MAX_HW, int(self.high_water * 1.5) + 65536)
-        elif elapsed_ms > FLOW_SLOW_DRAIN_MS:
-            self.high_water = max(FLOW_MIN_HW, self.high_water // 2)
+        self.low_water = self.high_water // 2
 
-
-def _req_client_ip(request: Request) -> str:
-    fwd = request.headers.get("x-forwarded-for")
-    if fwd:
-        return fwd.split(",")[0].strip()
-    real_ip = request.headers.get("x-real-ip")
-    if real_ip:
-        return real_ip.strip()
-    return request.client.host if request.client else "نامشخص"
+    async def wait_if_full(self, current_bytes: int):
+        if current_bytes >= self.high_water:
+            while current_bytes > self.low_water:
+                await asyncio.sleep(0.005)
+                current_bytes = self.queue.qsize() * XHTTP_BUF
 
 
-async def _open_tcp_from_header(first_chunk: bytes):
-    command, address, port, payload = await parse_vless_header(first_chunk)
-    reader, writer = await asyncio.wait_for(
-        asyncio.open_connection(address, port), timeout=TCP_CONNECT_TIMEOUT
-    )
-    _tune_socket(writer)
-    if payload:
-        writer.write(payload)
-        await writer.drain()
-    return reader, writer, address, port
+class XHTTPSession:
+    """مدیریت سشن‌های فعال XHTTP"""
 
+    def __init__(self, session_id: str, link_name: str, client_ip: str):
+        self.session_id = session_id
+        self.link_name = link_name
+        self.client_ip = client_ip
+        self.downlink_queue = asyncio.Queue(maxsize=DOWNLINK_QUEUE_MAX)
+        self.reader: asyncio.StreamReader | None = None
+        self.writer: asyncio.StreamWriter | None = None
+        self.last_active = time.monotonic()
+        self.closed = False
+        self.flow_control = _AdaptiveFlow(self.downlink_queue)
+        self.quota_gate = _QuotaGate(link_name, client_ip)
 
-async def _check_link(uuid: str):
-    async with LINKS_LOCK:
-        link = LINKS.get(uuid)
-    if not is_link_allowed(link):
-        raise HTTPException(status_code=403, detail="not authorized")
+    def touch(self):
+        self.last_active = time.monotonic()
 
-
-async def _get_or_create_session(uuid: str, mode: str, session_id: str, ip: str = "نامشخص") -> dict:
-    """Session بر اساس session_id که خودِ کلاینت در URL فرستاده، lazily ساخته می‌شه."""
-    async with XHTTP_LOCK:
-        sess = xhttp_sessions.get(session_id)
-        if sess is not None:
-            sess["last_seen"] = time.time()
-            return sess
-
-        async with LINKS_LOCK:
-            link = LINKS.get(uuid)
-        if not is_ip_allowed(link, uuid, ip):
-            logger.warning(f"🚫 XHTTP[{mode}] rejected uuid={uuid[:8]} ip={ip} (ip limit reached)")
-            raise HTTPException(status_code=403, detail="ip limit reached")
-
-        conn_id = secrets.token_urlsafe(6)
-        connections[conn_id] = {
-            "uuid": uuid,
-            "ip": ip,
-            "connected_at": datetime.now().isoformat(),
-            "bytes": 0,
-            "transport": f"xhttp-{mode}",
-        }
-        sess = {
-            "uuid": uuid, "mode": mode, "writer": None,
-            "downlink_task": None, "uplink_task": None,
-            "down_q": asyncio.Queue(maxsize=DOWNLINK_QUEUE_MAX),
-            "last_seen": time.time(),
-            "conn_id": conn_id, "tcp_open": False, "closed": False,
-            "seq_buf": {}, "next_seq": 0,
-            "gate": None,  # لازی ساخته می‌شه: _QuotaGate تطبیقی مخصوص stream-up
-            "flow": None,  # لازی ساخته می‌شه: _AdaptiveFlow مخصوص stream-up
-        }
-        xhttp_sessions[session_id] = sess
-        logger.info(f"new XHTTP[{mode}] session [{session_id[:8]}] uuid={uuid[:8]} ip={ip}")
-        return sess
-
-
-async def _teardown(session_id: str):
-    async with XHTTP_LOCK:
-        sess = xhttp_sessions.pop(session_id, None)
-    if not sess:
-        return
-    sess["closed"] = True
-    for t in ("uplink_task", "downlink_task"):
-        task = sess.get(t)
-        if task:
-            task.cancel()
+    async def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        if self.writer:
             try:
-                await task
-            except (asyncio.CancelledError, Exception):
+                self.writer.close()
+                await self.writer.wait_closed()
+            except Exception:
                 pass
-    writer = sess.get("writer")
-    if writer:
-        try:
-            writer.close()
-            await writer.wait_closed()
-        except Exception:
-            pass
-    connections.pop(sess.get("conn_id"), None)
-    dq = sess.get("down_q")
-    if dq:
-        try:
-            dq.put_nowait(None)
-        except Exception:
-            pass
-    logger.info(f"closed XHTTP[{sess.get('mode')}] [{session_id[:8]}] total={len(xhttp_sessions)}")
 
 
-async def _reaper():
+async def _session_reaper():
+    """پاکسازی سشن‌های منقضی شده به‌صورت دوره‌ای"""
     while True:
         await asyncio.sleep(REAPER_INTERVAL)
-        now = time.time()
+        now = time.monotonic()
+        to_delete = []
+
         async with XHTTP_LOCK:
-            stale = [sid for sid, s in xhttp_sessions.items()
-                     if now - s["last_seen"] > SESSION_IDLE_TIMEOUT and not s.get("tcp_open")]
-        for sid in stale:
-            await _teardown(sid)
+            for session_id, sess in xhttp_sessions.items():
+                if now - sess.last_active > SESSION_IDLE_TIMEOUT or sess.closed:
+                    to_delete.append(session_id)
+
+            for session_id in to_delete:
+                sess = xhttp_sessions.pop(session_id, None)
+                if sess:
+                    await sess.close()
 
 
-_reaper_started = False
+@router.on_event("startup")
+async def startup_event():
+    asyncio.create_task(_session_reaper())
 
 
-def ensure_reaper():
-    global _reaper_started
-    if not _reaper_started:
-        asyncio.create_task(_reaper())
-        _reaper_started = True
+# ── هندلرهای اصلی API ─────────────────────────────────────────────────────────
 
+@router.post("/xhttp/packet-up")
+async def xhttp_packet_up(request: Request):
+    """مد مدیریت آپلینک به‌صورت Packet-based"""
+    session_id = request.headers.get("x-session-id")
+    link_name = request.headers.get("x-link-name", "default")
+    client_ip = request.client.host if request.client else "0.0.0.0"
 
-async def _pump_tcp_to_queue(session_id: str, uuid: str, reader: asyncio.StreamReader, down_q: asyncio.Queue):
-    first = True
-    gate = _QuotaGate(uuid)  # دانلینک هم از همون گیت batched استفاده می‌کنه
-    try:
-        while True:
-            data = await reader.read(XHTTP_BUF)
-            if not data:
-                break
-            if not await gate.add(len(data)):
-                break
-            await throttle(uuid, len(data))
-            async with XHTTP_LOCK:
-                sess = xhttp_sessions.get(session_id)
-            if sess:
-                c = connections.get(sess["conn_id"])
-                if c:
-                    c["bytes"] += len(data)
-            payload = (b"\x00\x00" + data) if first else data
-            first = False
-            await down_q.put(payload)
-    except (asyncio.CancelledError, Exception):
-        pass
-    finally:
-        await gate.flush()
-        await _teardown(session_id)
+    if not is_ip_allowed(client_ip) or not is_link_allowed(link_name):
+        raise HTTPException(status_code=403, detail="Access denied")
 
-
-async def _open_tcp_for_session(session_id: str, uuid: str, sess: dict, first_chunk: bytes):
-    """تونل TCP رو از روی هدر VLESS باز می‌کنه و پمپ دانلینک رو راه می‌اندازه."""
-    reader, writer, address, port = await _open_tcp_from_header(first_chunk)
-    logger.info(f"connect XHTTP[{sess['mode']}] [{session_id[:8]}] -> {address}:{port}")
-    sess["writer"] = writer
-    sess["tcp_open"] = True
-    sess["downlink_task"] = asyncio.create_task(
-        _pump_tcp_to_queue(session_id, uuid, reader, sess["down_q"])
-    )
-    asyncio.create_task(save_state())
-
-
-def _downstream_gen(sess: dict):
-    async def gen():
-        try:
-            while True:
-                chunk = await sess["down_q"].get()
-                if chunk is None:
-                    break
-                sess["last_seen"] = time.time()
-                yield chunk
-        finally:
-            pass
-    return gen()
-
-
-# ══════════════════════════════ GET دانلینک (مشترک بین سه مد) ══════════════════════════════
-@router.get("/xhttp-siz10/{mode}/{uuid}/{session_id}")
-async def xhttp_downlink(mode: str, uuid: str, session_id: str, request: Request):
-    ensure_reaper()
-    if mode not in ("packet-up", "stream-up"):
-        raise HTTPException(status_code=404, detail="unknown mode")
-    await _check_link(uuid)
-    fp = request.query_params.get("fp", DEFAULT_FINGERPRINT)
-    sess = await _get_or_create_session(uuid, mode, session_id, _req_client_ip(request))
-    if sess.get("closed"):
-        raise HTTPException(status_code=404, detail="session closed")
-
-    headers = _resp_headers(fp)
-    return StreamingResponse(_downstream_gen(sess), headers=headers, media_type=headers["content-type"])
-
-
-# ══════════════════════════════ PACKET-UP (آپلینک با seq) ══════════════════════════════
-@router.post("/xhttp-siz10/packet-up/{uuid}/{session_id}/{seq}")
-async def packet_up_upload(uuid: str, session_id: str, seq: int, request: Request):
-    ensure_reaper()
-    sess = await _get_or_create_session(uuid, "packet-up", session_id, _req_client_ip(request))
-    if sess.get("closed"):
-        raise HTTPException(status_code=404, detail="session closed")
-
-    sess["last_seen"] = time.time()
     body = await request.body()
     if not body:
-        return {"ok": True}
+        return {"status": "ok"}
 
-    if not await check_and_use(uuid, len(body)):
-        await _teardown(session_id)
-        raise HTTPException(status_code=403, detail="quota/disabled/unknown")
-    await throttle(uuid, len(body))
+    async with XHTTP_LOCK:
+        sess = xhttp_sessions.get(session_id)
 
-    stats["total_requests"] += 1
-    connections[sess["conn_id"]]["bytes"] += len(body)
+    if not sess or sess.closed:
+        raise HTTPException(status_code=404, detail="Session not found")
 
+    sess.touch()
+    await sess.quota_gate.consume(len(body))
+
+    if sess.writer and not sess.writer.is_closing():
+        sess.writer.write(body)
+        await sess.writer.drain()
+
+    return {"status": "ok"}
+
+
+@router.post("/xhttp/stream-up")
+async def xhttp_stream_up(request: Request):
+    """مد stream-up با موتور تطبیقی و اتصال مستقیم به سوکت تارگت VLESS"""
+    session_id = request.headers.get("x-session-id") or secrets.token_hex(16)
+    link_name = request.headers.get("x-link-name", "default")
+    client_ip = request.client.host if request.client else "0.0.0.0"
+
+    if not is_ip_allowed(client_ip) or not is_link_allowed(link_name):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    sess = XHTTPSession(session_id, link_name, client_ip)
+    async with XHTTP_LOCK:
+        xhttp_sessions[session_id] = sess
+
+    # خواندن چانک اول برای پارس کردن هدر VLESS
+    first_chunk = await request.stream().__anext__()
+    if not first_chunk:
+        raise HTTPException(status_code=400, detail="Empty stream")
+
+    target_host, target_port, header_len = parse_vless_header(first_chunk)
+    
+    # برقراری اتصال به سرور مقصد
     try:
-        if sess["writer"] is None:
-            # اولین پکتی که حاوی هدر VLESS است، می‌تونه seq=0 نباشه اگر پکت‌ها
-            # خارج از ترتیب برسن؛ بافر کوچیک برای سورت کردن seqهای زودرس.
-            if seq != 0:
-                sess["seq_buf"][seq] = body
-                return {"ok": True, "buffered": True}
-            await _open_tcp_for_session(session_id, uuid, sess, body)
-            # هر پکت بافرشده‌ای که حالا نوبتش رسیده رو هم بفرست
-            nxt = 1
-            while nxt in sess["seq_buf"]:
-                pending = sess["seq_buf"].pop(nxt)
-                sess["writer"].write(pending)
-                nxt += 1
-            sess["next_seq"] = nxt
-            return {"ok": True, "connected": True}
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(target_host, target_port),
+            timeout=TCP_CONNECT_TIMEOUT
+        )
+    except Exception as e:
+        await sess.close()
+        raise HTTPException(status_code=502, detail=f"Connection failed: {str(e)}")
 
-        if seq == sess["next_seq"]:
-            sess["writer"].write(body)
-            sess["next_seq"] += 1
-            while sess["next_seq"] in sess["seq_buf"]:
-                pending = sess["seq_buf"].pop(sess["next_seq"])
-                sess["writer"].write(pending)
-                sess["next_seq"] += 1
-        else:
-            sess["seq_buf"][seq] = body
+    _tune_socket(writer)
+    sess.reader = reader
+    sess.writer = writer
 
-        if sess["writer"].transport.get_write_buffer_size() > PACKET_UP_HIGH_WATER:
-            await sess["writer"].drain()
-    except Exception as exc:
-        error_logs.append({"error": str(exc), "time": datetime.now().isoformat()})
-        await _teardown(session_id)
-        raise HTTPException(status_code=502, detail="write failed")
+    # ارسال باقی‌مانده چانک اول بعد از هدر VLESS به تارگت
+    vless_payload = first_chunk[header_len:]
+    if vless_payload:
+        await sess.quota_gate.consume(len(vless_payload))
+        writer.write(vless_payload)
+        await writer.drain()
 
-    return {"ok": True}
+    # کوروتین خواندن متوالی از استریم آپلینک کلاینت
+    async def _upload_loop():
+        try:
+            async for chunk in request.stream():
+                if sess.closed:
+                    break
+                sess.touch()
+                await sess.quota_gate.consume(len(chunk))
+                writer.write(chunk)
+                await writer.drain()
+        except Exception:
+            pass
+        finally:
+            await sess.close()
 
+    # کوروتین خواندن از تارگت و فرستادن به صف دانلود (Downlink)
+    async def _download_loop():
+        try:
+            bytes_in_queue = 0
+            while not sess.closed:
+                data = await reader.read(XHTTP_BUF)
+                if not data:
+                    break
+                
+                sess.touch()
+                t0 = time.monotonic()
+                
+                await sess.downlink_queue.put(data)
+                bytes_in_queue += len(data)
 
-# ══════════════════════════════ STREAM-UP (یک POST پیوسته) ══════════════════════════════
-# موتور تطبیقی: _QuotaGate (batch کوتا بر اساس نرخ واقعی) + _AdaptiveFlow (AIMD روی
-# high-water درین) + کش رفرنس‌ها داخل لوپ. هیچ داده‌ای بافر/coalesce نمی‌شه —
-# هر بایت فوری write() می‌شه، فقط «کِی صبر کنیم برای drain» تطبیقیه.
-@router.post("/xhttp-siz10/stream-up/{uuid}/{session_id}")
-async def stream_up_upload(uuid: str, session_id: str, request: Request):
-    ensure_reaper()
-    sess = await _get_or_create_session(uuid, "stream-up", session_id, _req_client_ip(request))
-    if sess.get("closed"):
-        raise HTTPException(status_code=404, detail="session closed")
+                # اِعمال کنترل جریان تطبیقی AIMD
+                await sess.flow_control.wait_if_full(bytes_in_queue)
+                
+                drain_ms = (time.monotonic() - t0) * 1000
+                sess.flow_control.adjust(drain_ms)
+                bytes_in_queue = sess.downlink_queue.qsize() * XHTTP_BUF
+        except Exception:
+            pass
+        finally:
+            await sess.close()
 
-    gate = sess.get("gate")
-    if gate is None:
-        gate = _QuotaGate(uuid)
-        sess["gate"] = gate
+    asyncio.create_task(_upload_loop())
+    asyncio.create_task(_download_loop())
 
-    flow = sess.get("flow")
-    if flow is None:
-        flow = _AdaptiveFlow()
-        sess["flow"] = flow
-
-    conn = connections[sess["conn_id"]]   # یک بار لوک‌آپ، نه هر چانک
-    writer = sess["writer"]               # ممکنه هنوز None باشه
-
-    try:
-        async for chunk in request.stream():
-            if not chunk:
-                continue
-            sess["last_seen"] = time.time()
-
-            if not await gate.add(len(chunk)):
-                raise HTTPException(status_code=403, detail="quota/disabled/unknown")
-            await throttle(uuid, len(chunk))
-
-            stats["total_requests"] += 1
-            conn["bytes"] += len(chunk)
-
-            if writer is None:
-                await _open_tcp_for_session(session_id, uuid, sess, chunk)
-                writer = sess["writer"]
+    # پاسخ Downlink به‌صورت Streaming
+    async def _stream_downloader():
+        fp = request.headers.get("x-fingerprint", DEFAULT_FINGERPRINT)
+        while not sess.closed or not sess.downlink_queue.empty():
+            try:
+                data = await asyncio.wait_for(sess.downlink_queue.get(), timeout=1.0)
+                yield data
+            except asyncio.TimeoutError:
                 continue
 
-            writer.write(chunk)
-            if flow.should_drain(writer.transport.get_write_buffer_size()):
-                await flow.drain(writer)
-    except HTTPException:
-        await gate.flush()
-        await _teardown(session_id)
-        raise
-    except Exception as exc:
-        error_logs.append({"error": str(exc), "time": datetime.now().isoformat()})
-        await gate.flush()
-        await _teardown(session_id)
-        raise HTTPException(status_code=502, detail="stream error")
+    headers = _resp_headers(request.headers.get("x-fingerprint", DEFAULT_FINGERPRINT))
+    headers["x-session-id"] = session_id
 
-    await gate.flush()
-    return {"ok": True}
+    return StreamingResponse(_stream_downloader(), headers=headers)
